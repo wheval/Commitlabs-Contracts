@@ -424,3 +424,241 @@ fn test_fee_queries_not_initialized_return_defaults() {
     });
     assert_eq!(collected_fees, 0);
 }
+
+#[test]
+fn test_record_fees_records_attestation_and_metrics() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let attestation_id = e.register_contract(None, AttestationEngineContract);
+    let core_id = e.register_contract(None, commitment_core::CommitmentCoreContract);
+
+    let admin = Address::generate(&e);
+    let commitment_id = String::from_str(&e, "commitment_fee");
+
+    e.as_contract(&attestation_id, || {
+        AttestationEngineContract::initialize(e.clone(), admin.clone(), core_id.clone()).unwrap();
+    });
+
+    let commitment = create_mock_commitment_with_status(
+        &e,
+        "commitment_fee",
+        "active",
+        1_000,
+        1_000,
+        10,
+    );
+    e.as_contract(&core_id, || {
+        e.storage().instance().set(
+            &commitment_core::DataKey::Commitment(commitment_id.clone()),
+            &commitment,
+        );
+    });
+
+    let result = e.as_contract(&attestation_id, || {
+        AttestationEngineContract::record_fees(
+            e.clone(),
+            admin.clone(),
+            commitment_id.clone(),
+            250,
+        )
+    });
+    assert_eq!(result, Ok(()));
+
+    let attestations = e.as_contract(&attestation_id, || {
+        AttestationEngineContract::get_attestations(e.clone(), commitment_id.clone())
+    });
+    assert_eq!(attestations.len(), 1);
+
+    let attestation = attestations.get(0).unwrap();
+    assert_eq!(
+        attestation.attestation_type,
+        String::from_str(&e, "fee_generation")
+    );
+    assert!(attestation.is_compliant);
+    assert_eq!(attestation.verified_by, admin);
+
+    let fee_amount_key = String::from_str(&e, "fee_amount");
+    let fee_value = attestation.data.get(fee_amount_key).unwrap();
+    assert_eq!(fee_value, String::from_str(&e, "250"));
+
+    let metrics = e.as_contract(&attestation_id, || {
+        AttestationEngineContract::get_stored_health_metrics(e.clone(), commitment_id.clone())
+    })
+    .unwrap();
+    assert_eq!(metrics.fees_generated, 250);
+}
+
+#[test]
+fn test_record_fees_negative_amount_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let attestation_id = e.register_contract(None, AttestationEngineContract);
+    let core_id = e.register_contract(None, commitment_core::CommitmentCoreContract);
+
+    let admin = Address::generate(&e);
+    let commitment_id = String::from_str(&e, "commitment_fee_negative");
+
+    e.as_contract(&attestation_id, || {
+        AttestationEngineContract::initialize(e.clone(), admin.clone(), core_id.clone()).unwrap();
+    });
+
+    let commitment = create_mock_commitment_with_status(
+        &e,
+        "commitment_fee_negative",
+        "active",
+        1_000,
+        1_000,
+        10,
+    );
+    e.as_contract(&core_id, || {
+        e.storage().instance().set(
+            &commitment_core::DataKey::Commitment(commitment_id.clone()),
+            &commitment,
+        );
+    });
+
+    let result = e.as_contract(&attestation_id, || {
+        AttestationEngineContract::record_fees(
+            e.clone(),
+            admin.clone(),
+            commitment_id.clone(),
+            -1,
+        )
+    });
+    assert_eq!(result, Err(AttestationError::InvalidFeeAmount));
+
+    let attestations = e.as_contract(&attestation_id, || {
+        AttestationEngineContract::get_attestations(e.clone(), commitment_id.clone())
+    });
+    assert_eq!(attestations.len(), 0);
+}
+
+#[test]
+fn test_record_drawdown_within_max_loss_records_drawdown() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let attestation_id = e.register_contract(None, AttestationEngineContract);
+    let core_id = e.register_contract(None, commitment_core::CommitmentCoreContract);
+
+    let admin = Address::generate(&e);
+    let commitment_id = String::from_str(&e, "commitment_drawdown_ok");
+
+    e.as_contract(&attestation_id, || {
+        AttestationEngineContract::initialize(e.clone(), admin.clone(), core_id.clone()).unwrap();
+    });
+
+    let commitment = create_mock_commitment_with_status(
+        &e,
+        "commitment_drawdown_ok",
+        "active",
+        1_000,
+        950,
+        10,
+    );
+    e.as_contract(&core_id, || {
+        e.storage().instance().set(
+            &commitment_core::DataKey::Commitment(commitment_id.clone()),
+            &commitment,
+        );
+    });
+
+    let result = e.as_contract(&attestation_id, || {
+        AttestationEngineContract::record_drawdown(
+            e.clone(),
+            admin.clone(),
+            commitment_id.clone(),
+            5,
+        )
+    });
+    assert_eq!(result, Ok(()));
+
+    let attestations = e.as_contract(&attestation_id, || {
+        AttestationEngineContract::get_attestations(e.clone(), commitment_id.clone())
+    });
+    assert_eq!(attestations.len(), 1);
+
+    let attestation = attestations.get(0).unwrap();
+    assert_eq!(
+        attestation.attestation_type,
+        String::from_str(&e, "drawdown")
+    );
+    assert!(attestation.is_compliant);
+
+    let drawdown_key = String::from_str(&e, "drawdown_percent");
+    let drawdown_value = attestation.data.get(drawdown_key).unwrap();
+    assert_eq!(drawdown_value, String::from_str(&e, "5"));
+
+    let metrics = e.as_contract(&attestation_id, || {
+        AttestationEngineContract::get_stored_health_metrics(e.clone(), commitment_id.clone())
+    })
+    .unwrap();
+    assert_eq!(metrics.drawdown_percent, 5);
+}
+
+#[test]
+fn test_record_drawdown_exceeds_max_loss_records_violation() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let attestation_id = e.register_contract(None, AttestationEngineContract);
+    let core_id = e.register_contract(None, commitment_core::CommitmentCoreContract);
+
+    let admin = Address::generate(&e);
+    let commitment_id = String::from_str(&e, "commitment_drawdown_violation");
+
+    e.as_contract(&attestation_id, || {
+        AttestationEngineContract::initialize(e.clone(), admin.clone(), core_id.clone()).unwrap();
+    });
+
+    let commitment = create_mock_commitment_with_status(
+        &e,
+        "commitment_drawdown_violation",
+        "active",
+        1_000,
+        800,
+        10,
+    );
+    e.as_contract(&core_id, || {
+        e.storage().instance().set(
+            &commitment_core::DataKey::Commitment(commitment_id.clone()),
+            &commitment,
+        );
+    });
+
+    let result = e.as_contract(&attestation_id, || {
+        AttestationEngineContract::record_drawdown(
+            e.clone(),
+            admin.clone(),
+            commitment_id.clone(),
+            15,
+        )
+    });
+    assert_eq!(result, Ok(()));
+
+    let attestations = e.as_contract(&attestation_id, || {
+        AttestationEngineContract::get_attestations(e.clone(), commitment_id.clone())
+    });
+    assert_eq!(attestations.len(), 2);
+
+    let drawdown_attestation = attestations.get(0).unwrap();
+    assert_eq!(
+        drawdown_attestation.attestation_type,
+        String::from_str(&e, "drawdown")
+    );
+    assert!(!drawdown_attestation.is_compliant);
+    let drawdown_key = String::from_str(&e, "drawdown_percent");
+    let drawdown_value = drawdown_attestation.data.get(drawdown_key).unwrap();
+    assert_eq!(drawdown_value, String::from_str(&e, "15"));
+
+    let violation_attestation = attestations.get(1).unwrap();
+    assert_eq!(
+        violation_attestation.attestation_type,
+        String::from_str(&e, "violation")
+    );
+    assert!(!violation_attestation.is_compliant);
+    let violation_type_key = String::from_str(&e, "violation_type");
+    let severity_key = String::from_str(&e, "severity");
+    let violation_type = violation_attestation.data.get(violation_type_key).unwrap();
+    let severity = violation_attestation.data.get(severity_key).unwrap();
+    assert_eq!(violation_type, String::from_str(&e, "max_loss_exceeded"));
+    assert_eq!(severity, String::from_str(&e, "high"));
+}
